@@ -1,0 +1,12 @@
+{
+  "name": "raman-flight-case-site",
+  "version": "1.0.0",
+  "description": "Static website with contact form backend for Raman Flight Case.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.4"
+  }
+}
