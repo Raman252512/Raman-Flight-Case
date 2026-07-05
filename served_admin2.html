@@ -1,0 +1,73 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Admin — Submissions</title>
+  <style>
+    body{font-family:Inter,system-ui,Arial,sans-serif;margin:0;background:#f7fafc;color:#111827}
+    .container{width:min(1100px,96%);margin:2rem auto}
+    h1{margin:0 0 1rem}
+    .controls{display:flex;gap:0.5rem;margin-bottom:1rem}
+    button,a.button{padding:0.6rem 0.9rem;border-radius:8px;border:none;background:#0b63f2;color:#fff;text-decoration:none}
+    table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden}
+    th,td{padding:0.75rem 1rem;border-bottom:1px solid #eef2f7;text-align:left}
+    th{background:#f1f5f9}
+    .muted{color:#64748b}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Contact Submissions</h1>
+    <div class="controls">
+      <a class="button" id="downloadCsv" href="/download-csv">Download CSV</a>
+      <button id="refresh">Refresh</button>
+      <button id="clear">Delete All</button>
+    </div>
+    <div id="status" class="muted">Loading...</div>
+    <div style="margin-top:1rem;overflow:auto">
+      <table id="submissionsTable">
+        <thead>
+          <tr><th>#</th><th>Name</th><th>Email</th><th>Message</th><th>Submitted At</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    async function fetchData(){
+      const statusEl = document.getElementById('status');
+      statusEl.textContent = 'Loading...';
+      try{
+        const resp = await fetch('/admin/data', { method: 'GET', credentials: 'same-origin' });
+        if(resp.status === 401){ window.location = '/admin'; return; }
+        const data = await resp.json();
+        const rows = data.submissions || [];
+        const tbody = document.querySelector('#submissionsTable tbody');
+        tbody.innerHTML = '';
+        rows.forEach((r,i)=>{
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>${i+1}</td><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.email)}</td><td>${escapeHtml(r.message)}</td><td>${escapeHtml(r.submittedAt)}</td>`;
+          tbody.appendChild(tr);
+        });
+        statusEl.textContent = `${rows.length} submission(s)`;
+      }catch(err){
+        statusEl.textContent = 'Error loading data';
+        console.error(err);
+      }
+    }
+
+    function escapeHtml(s){ if(!s) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+    document.getElementById('refresh').addEventListener('click', fetchData);
+    document.getElementById('clear').addEventListener('click', async ()=>{
+      if(!confirm('Delete all submissions and CSV?')) return;
+      const resp = await fetch('/admin/delete-all', { method: 'POST', credentials: 'same-origin' });
+      if(resp.ok){ alert('Deleted'); fetchData(); } else { alert('Failed'); }
+    });
+
+    fetchData();
+  </script>
+</body>
+</html>
