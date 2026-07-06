@@ -66,16 +66,17 @@ textarea {
 }
 
 .logo {
-  font-weight: 800;
-  font-size: 1.1rem;
-  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  text-decoration: none;
 }
 
-nav {
-  display: flex;
-  gap: 1.5rem;
-  flex-wrap: wrap;
-}
+.logo-img {
+  height: 110px;
+  width: auto;
+  display: block;
+  object-fit: contain;
+  }
 
 nav a {
   color: var(--muted);
