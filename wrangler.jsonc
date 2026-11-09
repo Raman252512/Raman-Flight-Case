@@ -1,0 +1,12 @@
+{
+  "name": "raman-flight-case",
+  "compatibility_date": "2026-11-09",
+  "pages_build_output_dir": "./dist",
+  "d1_databases": [
+    {
+      "binding": "QUOTES_DB",
+      "database_name": "raman-flight-case-quotes",
+      "database_id": "ed2e3a8e-7cc0-4642-935c-4f319488d0fb"
+    }
+  ]
+}

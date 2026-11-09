@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "include": [
+    "/submit",
+    "/submit/",
+    "/admin",
+    "/admin/*",
+    "/download-csv",
+    "/download-csv/"
+  ],
+  "exclude": []
+}

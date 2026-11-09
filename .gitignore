@@ -1,0 +1,9 @@
+.data/
+contact-submissions.json
+contact-submissions.csv
+.env*
+node_modules/
+*.log
+dist/
+.wrangler/
+.dev.vars*

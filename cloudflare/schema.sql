@@ -1,0 +1,12 @@
+CREATE TABLE IF NOT EXISTS quotes (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  phone TEXT NOT NULL,
+  email TEXT NOT NULL,
+  caseType TEXT NOT NULL,
+  message TEXT NOT NULL,
+  submittedAt TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rate_limits (key TEXT PRIMARY KEY, period INTEGER NOT NULL, count INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS rate_limits_period ON rate_limits (period);
+CREATE TABLE IF NOT EXISTS admin_sessions (id TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires INTEGER NOT NULL);

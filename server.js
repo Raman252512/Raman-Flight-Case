@@ -1,183 +1,252 @@
-const express = require('express');
-const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
-const bodyParser = require('body-parser');
+'use strict';
 
-const app = express();
-const port = process.env.PORT || 3000;
-const dataFilePath = path.join(__dirname, 'contact-submissions.json');
-const csvFilePath = path.join(__dirname, 'contact-submissions.csv');
-const ADMIN_PASSWORD = process.env.ADMIN_PASS || 'admin123';
-const validTokens = new Set();
+const http = require('node:http');
+const { readFile, writeFile, rename, mkdir } = require('node:fs/promises');
+const { resolve, dirname, join } = require('node:path');
+const { randomBytes, createHash, timingSafeEqual } = require('node:crypto');
 
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
-app.use(express.static(path.join(__dirname)));
+const port = Number(process.env.PORT || 3000);
+const host = process.env.HOST || '127.0.0.1';
+const production = process.env.NODE_ENV === 'production';
+const adminPassword = process.env.ADMIN_PASS || '';
+const adminEnabled = adminPassword.length >= 16;
+const dataFile = resolve(process.env.SUBMISSIONS_FILE || join(__dirname, '.data', 'contact-submissions.json'));
+const sessionAge = 8 * 60 * 60 * 1000;
+const sessions = new Map();
+const limits = new Map();
+const categories = {
+  custom: 'Custom Flight Cases',
+  instruments: 'Musical Instrument Cases',
+  audio: 'DJ & Audio Equipment Cases',
+  displays: 'LED & LCD Display Cases',
+  industrial: 'Industrial Equipment Cases',
+  tools: 'Tool Cases',
+  trolleys: 'Trolley Cases',
+  other: 'Not sure yet'
+};
+const files = new Map([
+  ['/', ['index.html', 'text/html; charset=utf-8']],
+  ['/index.html', ['index.html', 'text/html; charset=utf-8']],
+  ['/contact', ['contact.html', 'text/html; charset=utf-8']],
+  ['/contact.html', ['contact.html', 'text/html; charset=utf-8']],
+  ['/styles.css', ['styles.css', 'text/css; charset=utf-8']],
+  ['/script.js', ['script.js', 'text/javascript; charset=utf-8']],
+  ['/assets/favicon.svg', ['assets/favicon.svg', 'image/svg+xml']],
+  ['/assets/road-case.jpg', ['assets/road-case.jpg', 'image/jpeg']],
+  ['/assets/foam-case.jpg', ['assets/foam-case.jpg', 'image/jpeg']],
+  ['/assets/raman-logo.jpg', ['assets/raman-logo.jpg', 'image/jpeg']],
+  ['/assets/whatsapp.png', ['assets/whatsapp.png', 'image/png']]
+]);
 
-function getTokenFromReq(req) {
-  const cookie = req.headers.cookie || '';
-  const parts = cookie.split(';').map(c => c.trim());
-  const match = parts.find(p => p.startsWith('admin_token='));
-  return match ? match.split('=')[1] : null;
+const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+})[c]);
+const hash = (value) => createHash('sha256').update(value).digest();
+const matches = (a, b) => timingSafeEqual(hash(a), hash(b));
+const token = () => randomBytes(32).toString('hex');
+const error = (status, message) => Object.assign(new Error(message), { status });
+const html = (title, content) => `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
+<title>${esc(title)} | Raman Flight Case</title><link rel="stylesheet" href="/styles.css"></head>
+<body><main class="wrap admin"><h1>${esc(title)}</h1>${content}</main></body></html>`;
+
+function send(res, status, body, type = 'text/html; charset=utf-8', headers = {}) {
+  res.writeHead(status, {
+    'Content-Type': type, 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(body),
+    'Content-Security-Policy': "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    ...(production && { 'Strict-Transport-Security': 'max-age=31536000' }),
+    ...headers
+  });
+  res.end(res.req.method === 'HEAD' ? undefined : body);
+}
+const json = (res, status, payload) => send(res, status, JSON.stringify(payload), 'application/json; charset=utf-8');
+const redirect = (res, location, headers = {}) => send(res, 303, '', undefined, { Location: location, ...headers });
+
+function checkSource(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site && !['same-origin', 'none'].includes(site)) throw error(403, 'This request must come from this website.');
+  const origin = req.headers.origin;
+  if (origin) {
+    let parsed;
+    try { parsed = new URL(origin); } catch { throw error(403, 'Invalid request origin.'); }
+    const expected = process.env.PUBLIC_ORIGIN;
+    if (expected ? parsed.origin !== expected : parsed.host !== req.headers.host) {
+      throw error(403, 'This request must come from this website.');
+    }
+  }
 }
 
-function isAuth(req) {
-  const token = getTokenFromReq(req);
-  return token && validTokens.has(token);
+function throttle(key, max, windowMs) {
+  const now = Date.now();
+  for (const [entry, data] of limits) if (data.until <= now) limits.delete(entry);
+  const value = limits.get(key);
+  if (value ? value.count >= max : limits.size >= 10000) {
+    throw error(429, 'Too many attempts. Please try again later.');
+  }
+  if (value) value.count++;
+  else limits.set(key, { count: 1, until: now + windowMs });
 }
 
-app.get('/admin', (req, res) => {
-  if (isAuth(req)) {
-    return res.sendFile(path.join(__dirname, 'admin.html'));
+async function formData(req) {
+  if (req.headers['content-type']?.split(';')[0].trim() !== 'application/x-www-form-urlencoded') {
+    throw error(415, 'Unsupported form format.');
   }
-
-  res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Admin Login</title>
-  <style>body{font-family:Arial,Helvetica,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f7fafc} .card{background:#fff;padding:2rem;border-radius:0.75rem;box-shadow:0 10px 30px rgba(2,6,23,0.08);width:320px;text-align:center} input{width:100%;padding:0.6rem;margin-top:0.5rem;border-radius:0.5rem;border:1px solid #e2e8f0} button{margin-top:1rem;padding:0.6rem 1rem;border-radius:0.5rem;border:none;background:#0b63f2;color:#fff;font-weight:700;cursor:pointer}</style>
-</head>
-<body>
-  <div class="card">
-    <h2>Admin Login</h2>
-    <form method="post" action="/admin/login">
-      <input type="password" name="password" placeholder="Password" required />
-      <button type="submit">Sign in</button>
-    </form>
-  </div>
-</body>
-</html>`);
-});
-
-app.post('/admin/login', (req, res) => {
-  const { password } = req.body || {};
-  if (password === ADMIN_PASSWORD) {
-    const token = crypto.randomBytes(16).toString('hex');
-    validTokens.add(token);
-    res.cookie('admin_token', token, { httpOnly: true });
-    return res.redirect('/admin');
+  const maxBytes = 30000;
+  if (Number(req.headers['content-length']) > maxBytes) throw error(413, 'This request is too large.');
+  let size = 0;
+  const chunks = [];
+  // Keep the socket open to return a clear error for oversized chunked requests.
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+    size += chunk.length;
+    if (size > maxBytes) { req.resume(); throw error(413, 'This request is too large.'); }
+    chunks.push(chunk);
   }
-  return res.status(401).send('<h1>Unauthorized</h1><p>Invalid password.</p>');
-});
+  return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+}
 
-app.get('/admin/data', (req, res) => {
-  if (!isAuth(req)) return res.status(401).json({ error: 'unauthorized' });
-  let submissions = [];
+async function readRows() {
   try {
-    if (fs.existsSync(dataFilePath)) {
-      const fileData = fs.readFileSync(dataFilePath, 'utf8');
-      submissions = JSON.parse(fileData || '[]');
-    }
+    const rows = JSON.parse(await readFile(dataFile, 'utf8'));
+    if (!Array.isArray(rows) || rows.some((row) => !row || typeof row !== 'object')) throw Error('Invalid data file');
+    return rows;
   } catch (err) {
-    console.error('Error reading submissions for admin:', err);
+    if (err.code === 'ENOENT') return [];
+    throw err;
   }
-  res.json({ submissions });
-});
+}
+async function saveRows(rows) {
+  await mkdir(dirname(dataFile), { recursive: true, mode: 0o700 });
+  const temporary = dataFile + '.tmp';
+  await writeFile(temporary, JSON.stringify(rows, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await rename(temporary, dataFile);
+}
+let pending = Promise.resolve();
+function changeRows(update) {
+  const job = pending.then(async () => saveRows(update(await readRows())));
+  pending = job.catch(() => {});
+  return job;
+}
 
-app.post('/admin/delete-all', (req, res) => {
-  if (!isAuth(req)) return res.status(401).send('unauthorized');
-  try {
-    fs.writeFileSync(dataFilePath, JSON.stringify([], null, 2), 'utf8');
-    if (fs.existsSync(csvFilePath)) fs.unlinkSync(csvFilePath);
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error('Error clearing submissions:', err);
-    return res.status(500).json({ ok: false });
+const cookieName = production ? '__Host-raman_admin' : 'raman_admin';
+function cookie(value, maxAge) {
+  return `${cookieName}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${production ? '; Secure' : ''}`;
+}
+function session(req) {
+  for (const [id, item] of sessions) if (item.expires <= Date.now()) sessions.delete(id);
+  const pair = (req.headers.cookie || '').split(';').map((v) => v.trim()).find((v) => v.startsWith(cookieName + '='));
+  const id = pair?.slice(cookieName.length + 1);
+  return sessions.has(id) ? { id, ...sessions.get(id) } : null;
+}
+
+const fields = ['name', 'phone', 'email', 'caseType', 'message', 'submittedAt'];
+const labels = ['Name', 'Phone', 'Email', 'Case type', 'Project details', 'Submitted (UTC)'];
+const fieldValue = (row, field) => field === 'caseType' ? (Object.hasOwn(categories, row[field]) ? categories[row[field]] : '—') : row[field];
+function csvCell(value) {
+  const text = String(value ?? '');
+  const safe = /^[\t\r\n]|^\s*[=+@\-＝＋＠－]/u.test(text) ? "'" + text : text;
+  return '"' + safe.replace(/"/g, '""') + '"';
+}
+function adminPage(rows, auth) {
+  const cells = rows.slice().reverse().map((row) => '<tr>' + fields.map((field) => `<td>${esc(fieldValue(row, field))}</td>`).join('') + '</tr>').join('');
+  return html('Quote requests', `<p>${rows.length} saved request(s)</p>
+<div class="actions"><a class="button" href="/download-csv">Download CSV</a><a class="button outline" href="/">View website</a></div>
+<div class="table-wrap" tabindex="0" role="region" aria-label="Quote request records"><table><thead><tr>${labels.map((label) => `<th scope="col">${label}</th>`).join('')}</tr></thead><tbody>${cells || '<tr><td colspan="6">No requests yet.</td></tr>'}</tbody></table></div>
+<form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="${auth.csrf}"><button class="button outline">Sign out</button></form>
+${rows.length ? `<details><summary>Delete all quote requests</summary><form method="post" action="/admin/delete-all">
+<input type="hidden" name="csrf" value="${auth.csrf}"><label>Type DELETE ALL to confirm
+<input name="confirmation" required autocomplete="off" maxlength="10"></label>
+<p><button class="button outline">Permanently delete all requests</button></p></form></details>` : ''}`);
+}
+const loginPage = html('Admin sign in', `<form method="post" action="/admin/login">
+<label>Password <input type="password" name="password" autocomplete="current-password" maxlength="512" required></label>
+<p><button class="button">Sign in</button></p></form><a href="/">Return to the website</a>`);
+
+const success = 'We received your quote request. Raman Flight Case will use the contact details you provided to follow up.';
+function quoteResult(req, res, status, message) {
+  if (req.headers.accept?.includes('application/json')) return json(res, status, { message });
+  return send(res, status, html(status < 400 ? 'Quote request received' : 'Quote request could not be sent',
+    `<p>${esc(message)}</p><a href="/contact#quote">Back to the contact page</a>`));
+}
+
+async function route(req, res) {
+  const path = new URL(req.url, 'http://local').pathname;
+  const get = req.method === 'GET' || req.method === 'HEAD';
+  const ip = req.socket.remoteAddress;
+  if (get && files.has(path)) {
+    const [file, type] = files.get(path);
+    return send(res, 200, await readFile(join(__dirname, 'public', file)), type, {
+      'Cache-Control': path.startsWith('/assets/') ? 'public, max-age=86400' : 'no-cache'
+    });
   }
-});
-
-app.post('/submit', (req, res) => {
-  const { name, phone, email, message, captcha } = req.body;
-  const submission = {
-    name: name ? name.trim() : '',
-    phone: phone ? phone.trim() : '',
-    email: email ? email.trim() : '',
-    message: message ? message.trim() : '',
-    submittedAt: new Date().toISOString()
-  };
-
-  if (!submission.name || !submission.phone || !submission.email || !submission.message || !captcha) {
-    return res.status(400).send('<h1>Submission failed</h1><p>Please fill in all fields.</p>');
+  if (req.method === 'POST' && path === '/submit') {
+    checkSource(req);
+    throttle('quote:all', 100, 15 * 60_000);
+    throttle('quote:' + ip, 12, 15 * 60_000);
+    const form = await formData(req);
+    if (form.get('website')) return quoteResult(req, res, 201, success);
+    const row = Object.fromEntries(fields.slice(0, 5).map((field) => [field, (form.get(field) || '').trim()]));
+    if (!row.name || row.name.length > 100 || !/^[+\d ().-]{7,30}$/.test(row.phone)
+        || row.phone.replace(/\D/g, '').length < 7
+        || row.email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.email)
+        || !Object.hasOwn(categories, row.caseType) || !row.message || row.message.length > 2000) {
+      throw error(400, 'Please provide a name, valid phone and email, case type, and project details.');
+    }
+    row.submittedAt = new Date().toISOString();
+    await changeRows((rows) => [...rows, row]);
+    return quoteResult(req, res, 201, success);
   }
 
-  if (captcha.trim() !== '7') {
-    return res.status(400).send('<h1>Submission failed</h1><p>Captcha answer is incorrect.</p>');
-  }
-
-  let submissions = [];
-  if (fs.existsSync(dataFilePath)) {
-    try {
-      const fileData = fs.readFileSync(dataFilePath, 'utf8');
-      submissions = JSON.parse(fileData);
-    } catch (error) {
-      console.error('Error reading submissions file:', error);
+  if (path === '/admin' || path.startsWith('/admin/') || path === '/download-csv') {
+    if (!adminEnabled) throw error(404, 'Page not found.');
+    const auth = session(req);
+    if (get && path === '/admin') return send(res, 200, auth ? adminPage(await readRows(), auth) : loginPage);
+    if (req.method === 'POST' && path === '/admin/login') {
+      checkSource(req);
+      throttle('admin:all', 30, 15 * 60_000);
+      throttle('admin:' + ip, 8, 15 * 60_000);
+      const password = (await formData(req)).get('password') || '';
+      if (!matches(password, adminPassword)) throw error(401, 'Invalid password.');
+      if (auth) sessions.delete(auth.id);
+      const id = token();
+      sessions.set(id, { csrf: token(), expires: Date.now() + sessionAge });
+      return redirect(res, '/admin', { 'Set-Cookie': cookie(id, sessionAge / 1000) });
+    }
+    if (!auth) throw error(401, 'Please sign in at /admin.');
+    if (get && path === '/admin/data') return json(res, 200, { submissions: await readRows() });
+    if (get && path === '/download-csv') {
+      const lines = (await readRows()).map((row) => fields.map((field) => csvCell(fieldValue(row, field))).join(','));
+      return send(res, 200, [labels.map(csvCell).join(','), ...lines].join('\r\n') + '\r\n',
+        'text/csv; charset=utf-8', { 'Content-Disposition': 'attachment; filename="quote-requests.csv"' });
+    }
+    if (req.method === 'POST' && ['/admin/logout', '/admin/delete-all'].includes(path)) {
+      checkSource(req);
+      const form = await formData(req);
+      if (!matches(form.get('csrf') || '', auth.csrf)) throw error(403, 'Invalid form token.');
+      if (path === '/admin/delete-all') {
+        if (form.get('confirmation') !== 'DELETE ALL') throw error(400, 'Type DELETE ALL to confirm.');
+        await changeRows(() => []);
+        if (req.headers.accept?.includes('application/json')) return json(res, 200, { ok: true });
+        return redirect(res, '/admin');
+      }
+      sessions.delete(auth.id);
+      return redirect(res, '/admin', { 'Set-Cookie': cookie('', 0) });
     }
   }
+  throw error(404, 'Page not found.');
+}
 
-  submissions.push(submission);
-  try {
-    fs.writeFileSync(dataFilePath, JSON.stringify(submissions, null, 2));
-  } catch (error) {
-    console.error('Error writing submissions file:', error);
-    return res.status(500).send('<h1>Server error</h1><p>Could not save your message.</p>');
-  }
-
-  const escapeCsvValue = (value) => {
-    if (typeof value !== 'string') return '';
-    return `"${value.replace(/"/g, '""')}"`;
-  };
-
-  const csvRow = [
-    escapeCsvValue(submission.name),
-    escapeCsvValue(submission.phone),
-    escapeCsvValue(submission.email),
-    escapeCsvValue(submission.message),
-    escapeCsvValue(submission.submittedAt)
-  ].join(',') + '\n';
-
-  try {
-    if (!fs.existsSync(csvFilePath)) {
-      const header = 'Name,Phone,Email,Message,Submitted At\n';
-      fs.writeFileSync(csvFilePath, header + csvRow, 'utf8');
-    } else {
-      fs.appendFileSync(csvFilePath, csvRow, 'utf8');
-    }
-  } catch (error) {
-    console.error('Error writing CSV file:', error);
-  }
-
-  res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Thank You</title>
-  <style>body{font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f8fafc;color:#111827;} .card{background:#fff;padding:2rem;border-radius:1rem;box-shadow:0 20px 50px rgba(15,23,42,0.12);max-width:500px;text-align:center;} a{display:inline-block;margin-top:1.5rem;padding:0.85rem 1.5rem;background:#0b63f2;color:#fff;border-radius:999px;text-decoration:none;}</style>
-</head>
-<body>
-  <div class="card">
-    <h1>Thank you!</h1>
-    <p>Your message has been sent successfully. We will contact you soon.</p>
-    <a href="/index.html">Return to website</a>
-    <a href="/download-csv" style="margin-left:1rem;">Download CSV</a>
-  </div>
-</body>
-</html>`);
+const server = http.createServer({ requestTimeout: 15000, headersTimeout: 10000 }, (req, res) => {
+  route(req, res).catch((err) => {
+    const status = err.status || 500;
+    if (status === 500) console.error('Request failed:', err.code || err.name);
+    const message = status === 500 ? 'Something went wrong. Please try again later.' : err.message;
+    if (req.url?.split('?')[0] === '/submit') return quoteResult(req, res, status, message);
+    return send(res, status, html(message, '<a href="/">Return to the website</a>'));
+  });
 });
-
-app.get('/download-csv', (req, res) => {
-  if (!isAuth(req)) {
-    return res.status(403).send('<h1>Forbidden</h1><p>Please sign in at <a href="/admin">/admin</a> to download.</p>');
-  }
-  if (!fs.existsSync(csvFilePath)) {
-    return res.status(404).send('<h1>No CSV found</h1><p>Please submit data first.</p>');
-  }
-  res.download(csvFilePath, 'contact-submissions.csv');
-});
-
-app.listen(port, () => {
-  console.log(`Server running at http://localhost:${port}`);
+server.listen(port, host, () => {
+  console.log(`Raman Flight Case: http://${host}:${server.address().port}`);
+  if (!adminEnabled) console.log('Admin is disabled. Set ADMIN_PASS to a strong password of at least 16 characters to enable it.');
 });
